@@ -1,0 +1,508 @@
+---
+title: "Protecting 30% of the Mexican EEZ"
+format: html
+editor: visual
+---
+
+## Using the PrioritzR workflow
+
+```{r setup= TRUE, include=FALSE}
+
+library(tidyverse)
+library(sf)
+library(rlist)
+library(prioritizr)
+```
+
+Within this analysis three cost scenarios are assumed:
+
+1.  Prioritization of planning units represent equal monitoring costs (Net implentation cost = 0)
+2.  Planning units increase their implementation costs as their distance to nearest port.
+3.  Planning units with higher fishing effort represent higher costs.
+
+### Scenario 1: Equal costs
+
+As a note, planning units represent the extension of the mexican Exclusive Economic Zone (EEZ) through all scenarios.
+
+```{r results='hide'}
+#Planning units
+
+pu <- st_read("data/shp/pu_lockedin.shp", crs=4326) %>% 
+        as.data.frame() %>% 
+        mutate(cost=0 #Assuming equal cost to all planning units
+               ) %>% 
+        st_as_sf(.)
+```
+
+The conservation features correspond to marine richness and habitats distribution, average Chlorophyll-a concentration, Mean Carbon Stock, Diving sites, cumulative fishing hours (2018-2021) and marine heatwaves for the EEZ.
+
+```{r}
+
+# All conservation features
+
+(features <- list.files(path = "data/features/adjusted/", 
+                       pattern='_adj.tif', 
+                       all.files=TRUE, 
+                       full.names=TRUE)
+)
+
+
+# Select features of interest
+features <- stack(features[c(1:3, 6, 7, 16:17, 20,  24:27)])
+
+crs(features) <- "+proj=longlat +datum=WGS84 +no_defs" 
+```
+
+The Gulf of Mexico is characterized by the presence of several oil, mining and resource extraction concessions, for this reason, all those areas designated for these activities will not be included as potential priority units (locked out).
+
+```{r}
+# Select features to remove from all priority solutions (locked out)
+
+deep <- raster("data/features/adjusted/concesiones_aguas_profundas_adj.tif")
+current <- raster("data/features/adjusted/concesiones_vigentes_adj.tif")
+lic <- raster("data/features/adjusted/licencia_extraccion_adj.tif")
+shared <- raster("data/features/adjusted/produccion_compartida_adj.tif")
+
+locked_out <- merge(deep, current, lic, shared)
+
+
+```
+
+```{r include=FALSE}
+rm(deep,
+   current,
+   lic,
+   shared)
+```
+
+Also, existing Marine Protected Areas (MPAs) within the EEZ are included in all prioritization outputs as planning units with a current conservation status (locked in).
+
+```{r}
+#Select planning units with current MPAs
+
+locked_in <- pu[pu$locked_in == 1, ]
+
+```
+
+To promote connectivity among prioritization solutions, linear constraints are used. These can be used to ensure that the prioritization provides adequate coverage of planning units that facilitate a high level of connectivity. I'm using the marine heatwaves feature, with an inverse scale, to promote connectivity between planning units that are naturally more resilient to climate change.
+
+```{r}
+#Connectivity data: Add linear constraints
+
+
+
+#Select Marine Heatwaves as connectivity feature (The scale is reverse, meaning that
+# higher values are smaller heatwaves)
+feat_con <- features[[nlayers(features)]]
+
+#Ensure 30% of connectivity
+threshold <- cellStats(feat_con, "sum")*0.30
+
+#select conservation features
+
+features <- features[[seq_len(11)]]
+
+#If the solution displays lots of planning units with low connectivity
+# convert the continuous values into binary values
+
+# calculate threshold limit
+## here we set a threshold limit based on the median
+threshold_limit <- quantile(feat_con, probs = 0.5)
+
+# convert continuous values to binary values
+feat_con_binary <- round(feat_con <= threshold_limit)
+
+```
+
+```{r include=FALSE}
+#Assign names to each feature
+names(features) <- c("Biodiversity", 
+                     "Chl_a_average",
+                     "Cold_corals",
+                     "Diving_sites",
+                     "Fishing_hours_2018-2021",
+                     "Kelp",
+                     "Knolls",
+                     "Mean_carbon_stock",
+                     "Seagrasses",
+                     "Seamounts",
+                     "Warm_corals")
+
+```
+
+Finally, we add a minimum conservation target for each feature.
+
+```{r}
+t1 <- c(
+        0.3, #Biodiversity
+        0.3, #Chl-a_average
+        0.3,#Cold corals
+        # 0, #Deep water extraction concessions
+        # 0, #current resource extraction concessions
+        0.3, #Diving sites
+        0.1, #fishing hours,
+        0.3, #Kelp
+        0.3, #Knolls
+        # 0, #Extraction licenses
+        0.3, #Mean carbon stock
+        # 0, #Shared production
+        0.3, #Seagrassses,
+        0.3, #Seamounts
+        0.3 #warmcorals
+        # ,0.3 #Invert heatwaves
+        
+        
+        
+)
+```
+
+The baseline problem specifies our planning units (locked in and locked out), conservation features, each with a relative target and minimum objective, with a 1000 solutions, using the Gurobi solver algorithm.
+
+```{r}
+
+#Seed for reproducebility 
+set.seed(1234)
+```
+
+```{r warning=FALSE}
+#Base problem
+
+p0 <- problem(pu, features, cost_column="cost") %>% 
+        add_min_set_objective() %>% 
+        add_relative_targets(t1) %>%
+        add_binary_decisions() %>% 
+        add_locked_in_constraints(locked_in) %>% 
+        add_locked_out_constraints(locked_out) %>%
+        add_gap_portfolio(number_solutions = 1000, pool_gap = 0.1) %>%
+        add_gurobi_solver(verbose = FALSE)
+```
+
+The solution for the baseline problem is:
+
+```{r warning=FALSE}
+#Solve 
+s0 <- solve(p0)
+
+
+s0_df <- s0 %>% 
+        as.data.frame()
+
+solution_columns <- which(grepl("solution", names(s0_df)))
+
+
+#Get the names string 
+solution_columns <- colnames(s0_df[, solution_columns])
+
+
+
+## Calculate selection frequency for each planning unit
+s0_df $selection_frequencies <- rowSums(s0_df [, solution_columns ])
+
+
+## Tranform it into simple feature
+s0_df <- st_as_sf(s0_df)
+
+
+solution <- s0_df %>% 
+        filter(selection_frequencies==1000) %>%
+        filter(locked_in!=1) %>% 
+        as.data.frame() %>% 
+        dplyr::select(id, locked_in, geometry) %>% 
+        st_as_sf(.)
+
+
+```
+
+The map only shows the priority units, MPAs are included in the solution but are left out for the visualization:
+
+```{r}
+
+# plot(solution)
+
+mapview::mapview(solution, zcol="locked_in")
+```
+
+To baseline problem we add connectivity according to the marine heatwaves feature:
+
+```{r}
+# Connectivity 30% of low marine heatwaves
+
+
+p1_con <- p0 %>% 
+        add_linear_constraints(data=feat_con_binary, 
+                               threshold=threshold,
+                               sense=">=")  
+#Notes: Currently the linear constraints are not working as intended
+# Priority zones are not clumping together
+```
+
+The prioritization solution obtained from this is as follows, noting that most of the priority units are scattered across the EEZ.
+
+```{r}
+#Solve 
+s1 <- solve(p1_con)
+
+
+s1_df <- s1 %>% 
+        as.data.frame()
+
+solution_columns <- which(grepl("solution", names(s1_df)))
+
+
+#Get the names string 
+solution_columns <- colnames(s1_df[, solution_columns])
+
+
+
+## Calculate selection frequency for each planning unit
+s1_df $selection_frequencies <- rowSums(s1_df [, solution_columns ])
+
+
+## Tranform it into simple feature
+s1_df <- st_as_sf(s1_df)
+
+
+solution <- s1_df %>% 
+        filter(selection_frequencies==1000) %>%
+        # filter(locked_in!=1) %>% 
+        as.data.frame() %>% 
+        dplyr::select(id, locked_in, geometry) %>% 
+        st_as_sf(.)
+
+
+# plot(solution)
+
+mapview::mapview(solution, zcol="locked_in")
+```
+
+Let's use species richness for connectivity instead of marine heatwaves:
+
+```{r include=FALSE}
+# All conservation features
+(features2 <- list.files(path = "data/features/adjusted/", 
+                         pattern='_adj.tif', 
+                         all.files=TRUE, 
+                         full.names=TRUE)
+)
+
+
+# Select features of interest
+features2 <- stack(features2[c(1:3, 6, 7, 16:17, 20, 23:27)])
+
+crs(features2) <- "+proj=longlat +datum=WGS84 +no_defs"
+
+
+
+t2 <- c(
+        0.3, #Biodiversity
+        0.3, #Chl-a_average
+        0.3,#Cold corals
+        # 0, #Deep water extraction concessions
+        # 0, #current resource extraction concessions
+        0.3, #Diving sites
+        0.1, #fishing hours,
+        0.3, #Kelp
+        0.3, #Knolls
+        # 0, #Extraction licenses
+        0.3, #Mean carbon stock
+        # 0, #Shared production
+        0.3, #Seagrassses,
+        0.3, #Seamounts
+        0.3, #warmcorals
+        0.3 #heatwaves
+        # ,0.3 #Invert heatwaves
+        
+        
+        
+)
+
+
+
+#Connectivity data: Add linear constraints
+
+
+
+#Select Sepecies richness as connectivity feature 
+sp_con <- features2[[nlayers(features2)]]
+
+#Ensure 10% of connectivity
+threshold2 <- cellStats(sp_con, "sum")*0.30
+
+#select conservation features
+
+features2 <- features2[[seq_len(12)]]
+
+
+#If the solution displays lots of planning units with low connectivity
+# convert the continuous values into binary values
+
+# calculate threshold limit
+## here we set a threshold limit based on the median
+threshold_limit <- quantile(sp_con, probs = 0.5)
+
+# convert continuous values to binary values
+sp_con_binary <- round(sp_con <= threshold_limit)
+
+
+
+
+
+
+p1_sp <- problem(pu, features2, cost_column="cost") %>% 
+        add_min_set_objective() %>% 
+        add_relative_targets(t2) %>%
+        add_binary_decisions() %>% 
+        add_locked_in_constraints(locked_in) %>% 
+        add_locked_out_constraints(locked_out) %>%
+        add_gap_portfolio(number_solutions = 1000, pool_gap = 0.1) %>%
+        add_gurobi_solver(verbose = FALSE) %>% 
+        add_linear_constraints(data=sp_con_binary, 
+                               threshold=threshold2,
+                               sense=">=") 
+
+
+#Solve 
+s1_sp <- solve(p1_sp)
+
+
+s1_df_sp <- s1_sp %>% 
+        as.data.frame()
+
+solution_columns <- which(grepl("solution", names(s1_df_sp)))
+
+
+#Get the names string 
+solution_columns <- colnames(s1_df_sp[, solution_columns])
+
+
+
+## Calculate selection frequency for each planning unit
+s1_df_sp $selection_frequencies <- rowSums(s1_df_sp [, solution_columns ])
+
+
+## Tranform it into simple feature
+s1_df_sp <- st_as_sf(s1_df_sp)
+
+
+solution_sp <- s1_df_sp %>% 
+        filter(selection_frequencies==1000) %>%
+        # filter(locked_in!=1) %>% 
+        as.data.frame() %>% 
+        dplyr::select(id, locked_in, geometry) %>% 
+        st_as_sf(.) 
+
+
+
+```
+
+```{r}
+# plot(solution)
+
+mapview::mapview(solution_sp, zcol="locked_in")
+```
+
+To reduce fragmentation we can introduce boundary penalties:
+
+```{r}
+#Add boundary penalties to reduce spatial fragmentation
+
+# precompute the boundary data
+pu_boundary_data <- boundary_matrix(pu)
+
+# rescale boundary data
+pu_boundary_data@x <- scales::rescale(pu_boundary_data@x, 
+                              to = c(0.1, 100))
+
+
+p2_boundary <- p0 %>% 
+        add_boundary_penalties(penalty = 15, 
+                               data = pu_boundary_data) 
+```
+
+Higher penalty values favor solutions that tend to form clusters of priority units.
+
+```{r}
+#Solve 
+s2 <- solve(p2_boundary)
+
+
+s2_df <- s2 %>% 
+        as.data.frame()
+
+solution_columns <- which(grepl("solution", names(s2_df)))
+
+
+#Get the names string 
+solution_columns <- colnames(s2_df[, solution_columns])
+
+
+
+## Calculate selection frequency for each planning unit
+s2_df $selection_frequencies <- rowSums(s2_df [, solution_columns ])
+
+
+## Tranform it into simple feature
+s2_df <- st_as_sf(s2_df)
+
+
+solution <- s2_df %>% 
+        filter(selection_frequencies>=995) %>%
+        # filter(locked_in!=1) %>% 
+        as.data.frame() %>% 
+        dplyr::select(id, locked_in, geometry) %>% 
+        st_as_sf(.)
+
+# plot(solution)
+
+mapview::mapview(solution, zcol="locked_in")
+```
+
+Now the solution combining boundaries and connectivity:
+
+```{r}
+# Connectivity and Boundaries
+
+
+p3 <- p0 %>% 
+        add_boundary_penalties(penalty = 0.0001, 
+                               data = pu_boundary_data) %>% 
+        add_linear_constraints(data=feat_con, 
+                               threshold=threshold,
+                               sense=">=")         
+
+
+#Solve 
+s3 <- solve(p3)
+
+
+s3_df <- s3 %>% 
+        as.data.frame()
+
+solution_columns <- which(grepl("solution", names(s3_df)))
+
+
+#Get the names string 
+solution_columns <- colnames(s3_df[, solution_columns])
+
+
+
+## Calculate selection frequency for each planning unit
+s3_df $selection_frequencies <- rowSums(s3_df [, solution_columns ])
+
+
+## Tranform it into simple feature
+s3_df <- st_as_sf(s3_df)
+
+
+solution <- s3_df %>% 
+        filter(selection_frequencies==1000) %>%
+        # filter(locked_in!=1) %>%
+        as.data.frame() %>% 
+        dplyr::select(id, locked_in, geometry) %>% 
+        st_as_sf(.)
+
+
+# plot(solution)
+
+mapview::mapview(solution, zcol="locked_in")
+```
